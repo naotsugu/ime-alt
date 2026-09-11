@@ -20,7 +20,6 @@ use windows_sys::Win32::UI::WindowsAndMessaging::{
     WM_SYSKEYUP, WM_USER, WNDCLASSW, IDI_APPLICATION, LLKHF_INJECTED,
 };
 
-
 // virtual key code
 const VK_LMENU:   u32 = 0xA4; // left alt
 const VK_RMENU:   u32 = 0xA5; // right alt
@@ -71,7 +70,6 @@ fn main() {
             h_instance,
             null_mut()
         );
-
         if hwnd.is_null() {
             eprintln!("failed to create window");
             return;
@@ -186,7 +184,9 @@ unsafe extern "system" fn keyboard_proc(
 
         let kbd_struct = unsafe { *(l_param as *const KBDLLHOOKSTRUCT) };
 
-        // immediately pass injected inputs from SendInput to the next hook without processing        
+        // immediately pass injected inputs from SendInput to the next hook without processing
+        // LLKHF_INJECTED : specifies whether the event was injected programmatically
+        //                  (e.g., via the SendInput function)
         if (kbd_struct.flags & LLKHF_INJECTED) != 0 {
             return unsafe { CallNextHookEx(HOOK_HANDLE, n_code, w_param, l_param) };
         }
@@ -201,18 +201,21 @@ unsafe extern "system" fn keyboard_proc(
         if w_param == WM_KEYDOWN as usize ||
            w_param == WM_SYSKEYDOWN as usize {
 
-            if vk == VK_LMENU /* left alt key */ {
+            if vk == VK_LMENU {
+                // left alt key
                 unsafe {
                     if !LALT_PRESSED {
                         // reset combination
                         IS_COMBINATION = false;
+                        // mark left alt key pressed
                         LALT_PRESSED = true;
                     }
                 }
                 // consume an event
                 return 1;
 
-            } else if vk == VK_RMENU /* right alt key */ {
+            } else if vk == VK_RMENU {
+                // right alt key
                 unsafe {
                     if !RALT_PRESSED {
                         // reset combination
@@ -231,9 +234,13 @@ unsafe extern "system" fn keyboard_proc(
                     if LALT_PRESSED || RALT_PRESSED {
                         IS_COMBINATION = true;
 
-                        // for a key combination, immediately re-fire Alt KEYDOWN
+                        // for a key combination, immediately re-fire Alt keydown
                         // to trigger the native shortcut (e.g., Alt+Tab)
-                        let active_alt = if LALT_PRESSED { VK_LMENU as u16 } else { VK_RMENU as u16 };
+                        let active_alt = if LALT_PRESSED {
+                            VK_LMENU as u16
+                        } else {
+                            VK_RMENU as u16
+                        };
                         let mut inputs: [INPUT; 1] = std::mem::zeroed();
                         inputs[0].r#type = INPUT_KEYBOARD;
                         inputs[0].Anonymous.ki = KEYBDINPUT {
