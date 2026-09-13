@@ -1,6 +1,6 @@
 # ime-alt
 
-<p style="text-align: center;">
+<p align="center">
   <img src="https://github.com/naotsugu/ime-alt/blob/main/docs/128x128.png" alt="あlt">
 </p>
 
