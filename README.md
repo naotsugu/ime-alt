@@ -1,5 +1,10 @@
 # ime-alt
 
+<p style="text-align: center;">
+  ![あlt](docs/128x128.png)
+</p>
+
+
 ## Features
 
 This tool enables Mac-like IME switching on a US-ASCII keyboard.
