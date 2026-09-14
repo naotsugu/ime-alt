@@ -1,4 +1,3 @@
-
 ## How to release
 
 Update the version numbers of the following files.
