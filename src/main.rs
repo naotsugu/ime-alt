@@ -10,15 +10,7 @@ use windows_sys::Win32::UI::Input::KeyboardAndMouse::{
 use windows_sys::Win32::UI::Shell::{
     Shell_NotifyIconW, NIM_ADD, NIM_DELETE, NOTIFYICONDATAW, NIF_ICON, NIF_MESSAGE, NIF_TIP,
 };
-use windows_sys::Win32::UI::WindowsAndMessaging::{
-    CallNextHookEx, CreatePopupMenu, CreateWindowExW, DefWindowProcW, DestroyMenu,
-    DispatchMessageW, GetCursorPos, GetMessageW, LoadIconW, PostQuitMessage,
-    RegisterClassW, SetForegroundWindow, SetWindowsHookExW, TrackPopupMenu,
-    TranslateMessage, UnhookWindowsHookEx, HHOOK, HCURSOR, HICON, KBDLLHOOKSTRUCT, MSG,
-    TPM_BOTTOMALIGN, TPM_LEFTALIGN, WH_KEYBOARD_LL, WM_COMMAND, WM_DESTROY,
-    WM_KEYDOWN, WM_KEYUP, WM_RBUTTONUP, WM_SYSKEYDOWN,
-    WM_SYSKEYUP, WM_USER, WNDCLASSW, IDI_APPLICATION, LLKHF_INJECTED,
-};
+use windows_sys::Win32::UI::WindowsAndMessaging::{CallNextHookEx, CreatePopupMenu, CreateWindowExW, DefWindowProcW, DestroyMenu, DispatchMessageW, GetCursorPos, GetMessageW, LoadIconW, PostQuitMessage, RegisterClassW, SetForegroundWindow, SetWindowsHookExW, TrackPopupMenu, TranslateMessage, UnhookWindowsHookEx, HHOOK, HCURSOR, HICON, KBDLLHOOKSTRUCT, MSG, TPM_BOTTOMALIGN, TPM_LEFTALIGN, WH_KEYBOARD_LL, WM_COMMAND, WM_DESTROY, WM_KEYDOWN, WM_KEYUP, WM_RBUTTONUP, WM_SYSKEYDOWN, WM_SYSKEYUP, WM_USER, WNDCLASSW, IDI_APPLICATION, LLKHF_INJECTED, LoadImageW, IMAGE_ICON, LR_DEFAULTCOLOR, LR_DEFAULTSIZE};
 
 // virtual key code
 const VK_LMENU:   u32 = 0xA4; // left alt
@@ -76,7 +68,16 @@ fn main() {
         }
 
         // register system tray icon
-        let h_icon = LoadIconW(null_mut(), IDI_APPLICATION);
+        // If you set the width and height to 0 and specify LR_DEFAULTSIZE,
+        // an appropriate size is automatically selected—such as 16x16 at 100% DPI, 20x20 at 125% DPI, and so on.
+        let h_icon = LoadImageW(
+            h_instance,
+            1 as *const u16, // resource id 1
+            IMAGE_ICON,
+            0,
+            0,
+            LR_DEFAULTCOLOR | LR_DEFAULTSIZE,
+        ) as windows_sys::Win32::UI::WindowsAndMessaging::HICON;
         let mut nid: NOTIFYICONDATAW = std::mem::zeroed();
         nid.cbSize = std::mem::size_of::<NOTIFYICONDATAW>() as u32;
         nid.hWnd = hwnd;
