@@ -2,6 +2,12 @@
 name = "ime-alt"
 version = "0.1.0"
 edition = "2024"
+description = "Left/right Alt for IME on/off"
+authors = ["Naotsugu Kobayashi <naotsugukobayashi@gmail.com>"]
+homepage = "https://github.com/naotsugu/ime-alt"
+documentation = "https://github.com/naotsugu/ime-alt"
+repository = "https://github.com/naotsugu/ime-alt"
+license = "Apache-2.0"
 
 [dependencies]
 windows-sys = { version = "0.59", features = [
