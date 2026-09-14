@@ -10,6 +10,8 @@ windows-sys = { version = "0.59", features = [
     "Win32_System_LibraryLoader",
     "Win32_UI_Input_KeyboardAndMouse",
     "Win32_System_SystemServices",
+    "Win32_UI_Shell", # Shell_NotifyIconW
+    "Win32_Graphics_Gdi", # WNDCLASSW RegisterClassW ...
 ] }
 
 [target.'cfg(windows)'.build-dependencies]
