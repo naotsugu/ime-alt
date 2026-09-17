@@ -1,6 +1,6 @@
 [package]
 name = "ime-alt"
-version = "0.1.0"
+version = "0.1.1"
 edition = "2024"
 description = "Left/right Alt for IME on/off"
 authors = ["Naotsugu Kobayashi <naotsugukobayashi@gmail.com>"]
@@ -22,3 +22,7 @@ windows-sys = { version = "0.61", features = [
 
 [target.'cfg(windows)'.build-dependencies]
 winres = "0.1.12"
+
+[profile.release]
+strip = "debuginfo"
+panic = "abort"
