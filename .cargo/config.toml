@@ -1,0 +1,5 @@
+[target.x86_64-pc-windows-msvc]
+rustflags = [
+    "--remap-path-prefix", "D:/a/=/",
+    "--remap-path-prefix", "C:/Users/runneradmin/=/"
+]
