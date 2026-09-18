@@ -44,3 +44,10 @@ To uninstall `ime-alt`, exit the application and delete the downloaded `ime-alt.
 
 If you have added `ime-alt` to the Windows Startup folder, also delete its shortcut from the Startup folder.
 
+## Notice on Anti-Virus False Positives
+
+The application executable may occasionally be flagged as a Trojan or malware by some anti-virus (AV) software, particularly those utilizing machine learning heuristics. Such false positives are known to occur somewhat frequently with Rust projects.
+
+While it might be possible to mitigate this by modifying optimization flags or changing dependency crates to alter the resulting binary pattern, we have decided not to pursue these workarounds in this repository. This issue is limited to a small number of AV programs, and attempting to constantly bypass their detection often turns into a never-ending game of cat-and-mouse.
+
+If your AV software flags `ime-alt.exe` as malicious, it would be highly appreciated if you could report it as a false positive through your AV vendor's official reporting form.
