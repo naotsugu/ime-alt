@@ -22,10 +22,7 @@ use windows_sys::Win32::UI::WindowsAndMessaging::{
 // virtual key code
 const VK_LMENU:   u32 = 0xA4; // left alt
 const VK_RMENU:   u32 = 0xA5; // right alt
-const VK_CONTROL: i32 = 0x11; // ctrl (either side)
-const VK_SHIFT:   i32 = 0x10; // shift
-const VK_LWIN:    i32 = 0x5B; // left win
-const VK_RWIN:    i32 = 0x5C; // right win
+const VK_MENU:    i32 = 0x12; // alt (either side)
 const VK_IME_OFF: u16 = 0x1A; // ime off
 const VK_IME_ON:  u16 = 0x16; // ime on
 
@@ -219,7 +216,7 @@ unsafe extern "system" fn keyboard_proc(
                     if !LALT_PRESSED {
                         // reset combination
                         // if modifier is already held, it is a combination from the start
-                        IS_COMBINATION = is_modifier_pressed();
+                        IS_COMBINATION = is_other_key_pressed();
                         // mark left alt key pressed
                         LALT_PRESSED = true;
                         // Ctrl+Alt: pass the Alt keydown through instead of consuming it
@@ -238,7 +235,7 @@ unsafe extern "system" fn keyboard_proc(
                     if !RALT_PRESSED {
                         // reset combination
                         // if modifier is already held, it is a combination from the start
-                        IS_COMBINATION = is_modifier_pressed();
+                        IS_COMBINATION = is_other_key_pressed();
                         // mark right alt key pressed
                         RALT_PRESSED = true;
                         // Ctrl+Alt: pass the Alt keydown through instead of consuming it
@@ -346,13 +343,19 @@ unsafe fn send_key_press(vk_code: u16) {
     }
 }
 
-// returns `true` while either Ctrl / Shift / Win key is held down
+// returns true if any key other than Alt is currently held down
 // (the most significant bit of GetAsyncKeyState means "currently down")
-unsafe fn is_modifier_pressed() -> bool {
-    [VK_CONTROL, VK_SHIFT, VK_LWIN, VK_RWIN]
-        .iter()
-        .any(|&vk| (unsafe { GetAsyncKeyState(vk) } as u16 & 0x8000) != 0)
+unsafe fn is_other_key_pressed() -> bool {
+    // `0x01..=0x07` are mouse buttons, so start from 0x08 (the first keyboard key)
+    (0x08..=0xFE_i32).any(|vk| {
+        // skip the Alt keys (generic, left, right)
+        if vk == VK_MENU || vk == VK_LMENU as i32 || vk == VK_RMENU as i32 {
+            return false;
+        }
+        (unsafe { GetAsyncKeyState(vk) } as u16 & 0x8000) != 0
+    })
 }
+
 
 // utility for encoding string slice to UTF-16 
 fn encode_utf16(s: &str) -> Vec<u16> {
