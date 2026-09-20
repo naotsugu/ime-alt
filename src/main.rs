@@ -1,41 +1,65 @@
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")] // /SUBSYSTEM:WINDOWS hide console
 
+use std::ffi::c_void;
 use std::ptr::null_mut;
 use windows_sys::Win32::Foundation::{HWND, LPARAM, LRESULT, WPARAM};
 use windows_sys::Win32::Graphics::Gdi::HBRUSH;
 use windows_sys::Win32::System::LibraryLoader::GetModuleHandleW;
+use windows_sys::Win32::UI::Input::{
+    GetRawInputData, RegisterRawInputDevices, HRAWINPUT, RAWINPUT, RAWINPUTDEVICE, RAWINPUTHEADER,
+};
 use windows_sys::Win32::UI::Input::KeyboardAndMouse::{
-    SendInput, INPUT, INPUT_KEYBOARD, KEYBDINPUT, KEYEVENTF_KEYUP,
+    SendInput, INPUT, KEYBDINPUT, INPUT_KEYBOARD, KEYEVENTF_KEYUP,
 };
 use windows_sys::Win32::UI::Shell::{
-    Shell_NotifyIconW, NIM_ADD, NIM_DELETE, NOTIFYICONDATAW, NIF_ICON, NIF_MESSAGE, NIF_TIP,
+    Shell_NotifyIconW, NOTIFYICONDATAW, NIM_ADD, NIM_DELETE, NIF_ICON, NIF_MESSAGE, NIF_TIP,
 };
 use windows_sys::Win32::UI::WindowsAndMessaging::{
-    CallNextHookEx, CreatePopupMenu, CreateWindowExW, DefWindowProcW, DestroyMenu,
-    DispatchMessageW, GetCursorPos, GetMessageW, PostQuitMessage, RegisterClassW, LoadImageW,
-    SetForegroundWindow, SetWindowsHookExW, TrackPopupMenu, TranslateMessage, UnhookWindowsHookEx,
+    CallNextHookEx, CreatePopupMenu, CreateWindowExW, DefWindowProcW, DestroyMenu, DispatchMessageW,
+    GetCursorPos, GetMessageW, PostQuitMessage, RegisterClassW, LoadImageW, SetForegroundWindow,
+    SetWindowsHookExW, TrackPopupMenu, TranslateMessage, UnhookWindowsHookEx, AppendMenuW,
     HHOOK, HCURSOR, HICON, KBDLLHOOKSTRUCT, MSG, WNDCLASSW,
     TPM_BOTTOMALIGN, TPM_LEFTALIGN, WH_KEYBOARD_LL, WM_COMMAND, WM_DESTROY, WM_KEYDOWN, WM_KEYUP,
-    WM_RBUTTONUP, WM_SYSKEYDOWN, WM_SYSKEYUP, WM_USER, LLKHF_INJECTED, IMAGE_ICON,
-    LR_DEFAULTCOLOR, LR_DEFAULTSIZE
+    WM_RBUTTONUP, WM_SYSKEYDOWN, WM_SYSKEYUP, WM_USER, LLKHF_INJECTED, IMAGE_ICON, LR_DEFAULTCOLOR,
+    LR_DEFAULTSIZE, WM_INPUT, MF_STRING, MF_CHECKED, MF_UNCHECKED,
 };
 
 // virtual key code
-const VK_LMENU:   u32 = 0xA4; // left alt
-const VK_RMENU:   u32 = 0xA5; // right alt
-const VK_IME_OFF: u16 = 0x1A; // ime off
-const VK_IME_ON:  u16 = 0x16; // ime on
+const VK_LMENU:    u32 = 0xA4; // left alt
+const VK_RMENU:    u32 = 0xA5; // right alt
+const VK_IME_OFF:  u16 = 0x1A; // ime off
+const VK_IME_ON:   u16 = 0x16; // ime on
+const VK_LCONTROL: u16 = 0xA2; // left ctrl (emitted in place of CapsLock)
+
+// can code of the CapsLock key (also the "Eisu / CapsLock" key on Japanese keyboards).
+// the virtual-key code of this key can differ between key down and key up
+// (e.g. VK_CAPITAL vs VK_OEM_ATTN depending on the Shift state), so the key
+// is identified by its scan code instead of vkCode.
+const SC_CAPSLOCK: u32 = 0x3A;
+
+// raw Input constants (defined locally to stay independent of alias types in windows-sys)
+const RID_INPUT:        u32 = 0x1000_0003; // GetRawInputData: read the RAWINPUT data
+const RIM_TYPEKEYBOARD: u32 = 1;           // RAWINPUTHEADER.dwType: keyboard
+const RI_KEY_BREAK:     u16 = 0x0001;      // RAWKEYBOARD.Flags: key up
+const RIDEV_INPUTSINK:  u32 = 0x0000_0100; // receive input even when not in the foreground
 
 // custom window message for system tray notifications
 const WM_MY_TRAYICON: u32 = WM_USER + 1;
-// system tray menu item id
+// system tray menu item id (exit)
 const IDM_EXIT: usize = 1001;
+// system tray menu item id (toggle CapsLock -> Ctrl)
+const IDM_CAPS_TOGGLE: usize = 1002;
 
-static mut HOOK_HANDLE: HHOOK = null_mut();
-
+// alt state
 static mut IS_COMBINATION: bool = false;
 static mut LALT_PRESSED: bool = false;
 static mut RALT_PRESSED: bool = false;
+
+// CapsLock -> Ctrl state
+static mut CAPS_REMAP_ENABLED: bool = true; // feature on/off (toggled from the tray menu)
+static mut CAPS_PRESSED: bool = false;      // true while the emulated Ctrl is held down
+
+static mut HOOK_HANDLE: HHOOK = null_mut();
 
 fn main() {
     unsafe {
@@ -73,6 +97,20 @@ fn main() {
         if hwnd.is_null() {
             eprintln!("failed to create window");
             return;
+        }
+
+        // register for Raw Input (keyboard).
+        // Raw Input is not affected by what the low-level hook swallows,
+        // so it is used as a reliable source of the CapsLock "key up" event.
+        let rid = RAWINPUTDEVICE {
+            usUsagePage: 0x01, // generic desktop controls
+            usUsage: 0x06,     // keyboard
+            dwFlags: RIDEV_INPUTSINK,
+            hwndTarget: hwnd,
+        };
+        if RegisterRawInputDevices(&rid, 1, size_of::<RAWINPUTDEVICE>() as u32) == 0 {
+            // not fatal: the hook alone still handles CapsLock key up in most cases
+            eprintln!("failed to register raw input device");
         }
 
         // register system tray icon
@@ -114,6 +152,9 @@ fn main() {
             DispatchMessageW(&msg);
         }
 
+        // never leave the emulated Ctrl key stuck on exit
+        caps_up();
+
         // clear event hook
         UnhookWindowsHookEx(HOOK_HANDLE);
         Shell_NotifyIconW(NIM_DELETE, &nid);
@@ -135,15 +176,16 @@ unsafe extern "system" fn window_proc(
                 unsafe {
                     // create a menu when the system tray icon is clicked
                     let h_menu = CreatePopupMenu();
-                    let menu_text = encode_utf16("Exit");
-                    
+
+                    // add "CapsLock -> Ctrl" item (checked while enabled)
+                    let caps_text = encode_utf16("CapsLock -> Ctrl");
+                    let caps_flags = MF_STRING
+                        | if CAPS_REMAP_ENABLED { MF_CHECKED } else { MF_UNCHECKED };
+                    AppendMenuW(h_menu, caps_flags, IDM_CAPS_TOGGLE, caps_text.as_ptr());
+
                     // add Exit menu item
-                    windows_sys::Win32::UI::WindowsAndMessaging::AppendMenuW(
-                        h_menu,
-                        windows_sys::Win32::UI::WindowsAndMessaging::MF_STRING,
-                        IDM_EXIT,
-                        menu_text.as_ptr(),
-                    );
+                    let exit_text = encode_utf16("Exit");
+                    AppendMenuW(h_menu, MF_STRING, IDM_EXIT, exit_text.as_ptr());
 
                     // get current mouse position
                     let mut pos = std::mem::zeroed();
@@ -168,10 +210,27 @@ unsafe extern "system" fn window_proc(
             }
             0
         }
+
+        WM_INPUT => {
+            // Raw Input: used to detect the CapsLock key up reliably
+            unsafe { handle_raw_input(l_param); }
+            // DefWindowProc must be called for WM_INPUT so the system can clean up
+            unsafe { DefWindowProcW(hwnd, msg, w_param, l_param) }
+        }
+
         WM_COMMAND => {
-            // terminate the message loop if Exit is selected
-            if w_param == IDM_EXIT {
-                unsafe { PostQuitMessage(0); }
+            match w_param {
+                // terminate the message loop if Exit is selected
+                IDM_EXIT => unsafe { PostQuitMessage(0); },
+                // toggle CapsLock -> Ctrl
+                IDM_CAPS_TOGGLE => unsafe {
+                    CAPS_REMAP_ENABLED = !CAPS_REMAP_ENABLED;
+                    if !CAPS_REMAP_ENABLED {
+                        // release Ctrl if it is currently held by the emulation
+                        caps_up();
+                    }
+                },
+                _ => {}
             }
             0
         }
@@ -202,36 +261,44 @@ unsafe extern "system" fn keyboard_proc(
 
         let vk = kbd_struct.vkCode;
 
-        // key down
         // WM_KEYDOWN    : the virtual-key code of the nonsystem key
         //                 A nonsystem key is a key that is pressed when the ALT key is not pressed
         // WM_SYSKEYDOWN : the virtual-key code of the key being pressed
         //                 F10 key (which activates the menu bar) or holds down the ALT key and then presses another key
-        if w_param == WM_KEYDOWN as usize ||
-           w_param == WM_SYSKEYDOWN as usize {
+        // WM_KEYUP      : the virtual-key code of the nonsystem key
+        //                 a nonsystem key is a key that is pressed when the ALT key is not pressed
+        // WM_SYSKEYUP   : the user releases a key that was pressed while the ALT key was held down
+        let is_down = w_param == WM_KEYDOWN as usize || w_param == WM_SYSKEYDOWN as usize;
+        let is_up   = w_param == WM_KEYUP as usize || w_param == WM_SYSKEYUP as usize;
 
-            if vk == VK_LMENU {
-                // left alt key
-                unsafe {
-                    if !LALT_PRESSED {
-                        // reset combination
-                        IS_COMBINATION = false;
-                        // mark left alt key pressed
-                        LALT_PRESSED = true;
-                    }
+        // CapsLock -> Ctrl
+        // The key is identified by its scan code, not by vkCode (see SC_CAPSLOCK).
+        // Both down and up are always consumed so that the CapsLock state never toggles.
+        if unsafe { CAPS_REMAP_ENABLED } && kbd_struct.scanCode == SC_CAPSLOCK {
+            if is_down {
+                unsafe { caps_down(); }
+            } else if is_up {
+                unsafe { caps_up(); }
+            }
+            // consume an event
+            return 1;
+        }
+
+        // key down
+        if is_down {
+
+            if vk == VK_LMENU { // left alt key
+                // if Ctrl (emulated CapsLock) is held, Alt is passed through
+                // to the system as part of a combination instead of being consumed
+                if unsafe { alt_down(true) } {
+                    return unsafe { CallNextHookEx(HOOK_HANDLE, n_code, w_param, l_param) };
                 }
                 // consume an event
                 return 1;
 
-            } else if vk == VK_RMENU {
-                // right alt key
-                unsafe {
-                    if !RALT_PRESSED {
-                        // reset combination
-                        IS_COMBINATION = false;
-                        // mark right alt key pressed
-                        RALT_PRESSED = true;
-                    }
+            } else if vk == VK_RMENU { // right alt key
+                if unsafe { alt_down(false) } {
+                    return unsafe { CallNextHookEx(HOOK_HANDLE, n_code, w_param, l_param) };
                 }
                 // consume an event
                 return 1;
@@ -239,39 +306,12 @@ unsafe extern "system" fn keyboard_proc(
             } else {
                 // if another key is pressed while Alt is held down,
                 // it is considered a combination
-                unsafe {
-                    if LALT_PRESSED || RALT_PRESSED {
-                        IS_COMBINATION = true;
-
-                        // for a key combination, immediately re-fire Alt keydown
-                        // to trigger the native shortcut (e.g., Alt+Tab)
-                        let active_alt = if LALT_PRESSED {
-                            VK_LMENU as u16
-                        } else {
-                            VK_RMENU as u16
-                        };
-                        let mut inputs: [INPUT; 1] = std::mem::zeroed();
-                        inputs[0].r#type = INPUT_KEYBOARD;
-                        inputs[0].Anonymous.ki = KEYBDINPUT {
-                            wVk: active_alt,
-                            wScan: 0,
-                            dwFlags: 0,
-                            time: 0,
-                            dwExtraInfo: 0,
-                        };
-                        SendInput(1, inputs.as_mut_ptr(), std::mem::size_of::<INPUT>() as i32);
-                    }
-                }
+                unsafe { mark_combination_and_refire_alt(); }
             }
         }
 
         // key up
-        // WM_KEYUP    : the virtual-key code of the nonsystem key
-        //               a nonsystem key is a key that is pressed when the ALT key is not pressed
-        // WM_SYSKEYUP : the user releases a key that was pressed while the ALT key was held down
-        //               
-        if w_param == WM_KEYUP as usize ||
-           w_param == WM_SYSKEYUP as usize {
+        if is_up {
 
             if vk == VK_LMENU || vk == VK_RMENU {
 
@@ -302,7 +342,125 @@ unsafe extern "system" fn keyboard_proc(
     unsafe { CallNextHookEx(HOOK_HANDLE, n_code, w_param, l_param) }
 }
 
+// Called when a key other than Alt goes down (including the emulated Ctrl).
+// Marks the current Alt press as a combination and re-fires Alt keydown
+// to trigger the native shortcut (e.g., Alt+Tab).
+unsafe fn mark_combination_and_refire_alt() {
+    unsafe {
+        if LALT_PRESSED || RALT_PRESSED {
+            IS_COMBINATION = true;
 
+            let active_alt = if LALT_PRESSED {
+                VK_LMENU as u16
+            } else {
+                VK_RMENU as u16
+            };
+            send_key_event(active_alt, false);
+        }
+    }
+}
+
+// Alt keydown bookkeeping.
+// Returns `true` if the event must be passed to the system (not consumed).
+//
+// - auto-repeat of an already pressed Alt: consumed, state untouched
+// - first press while Ctrl (emulated CapsLock) is held: the press is a combination
+//   from the start, so the IME toggle is suppressed on release and the Alt keydown
+//   is passed through, giving the system a proper Ctrl+Alt
+// - first press otherwise: consumed, the decision is deferred to the key up
+unsafe fn alt_down(is_left: bool) -> bool {
+    unsafe {
+        let already_pressed = if is_left { LALT_PRESSED } else { RALT_PRESSED };
+        if already_pressed {
+            return false;
+        }
+
+        // reset combination (it is a combination right away if Ctrl is held)
+        IS_COMBINATION = CAPS_PRESSED;
+
+        // mark the alt key pressed
+        if is_left {
+            LALT_PRESSED = true;
+        } else {
+            RALT_PRESSED = true;
+        }
+
+        CAPS_PRESSED
+    }
+}
+
+// CapsLock physically pressed: start emulating Ctrl.
+unsafe fn caps_down() {
+    unsafe {
+        // ignore auto-repeat of the held key
+        if CAPS_PRESSED {
+            return;
+        }
+        CAPS_PRESSED = true;
+
+        // treat it like any other key pressed while Alt is held down
+        mark_combination_and_refire_alt();
+
+        send_key_event(VK_LCONTROL, false);
+    }
+}
+
+// CapsLock released: stop emulating Ctrl.
+// Idempotent: it is called from both the low-level hook and Raw Input,
+// whichever observes the key up first wins and the other one is a no-op.
+unsafe fn caps_up() {
+    unsafe {
+        if !CAPS_PRESSED {
+            return;
+        }
+        CAPS_PRESSED = false;
+
+        send_key_event(VK_LCONTROL, true);
+    }
+}
+
+// WM_INPUT handler: watch only for the CapsLock key up.
+unsafe fn handle_raw_input(l_param: LPARAM) {
+    unsafe {
+        let mut raw: RAWINPUT = std::mem::zeroed();
+        let mut size = size_of::<RAWINPUT>() as u32;
+
+        let ret = GetRawInputData(
+            l_param as HRAWINPUT,
+            RID_INPUT,
+            &mut raw as *mut RAWINPUT as *mut c_void,
+            &mut size,
+            size_of::<RAWINPUTHEADER>() as u32,
+        );
+        // GetRawInputData returns (UINT)-1 on error
+        if ret == u32::MAX || raw.header.dwType != RIM_TYPEKEYBOARD {
+            return;
+        }
+
+        let kb = raw.data.keyboard;
+        if kb.MakeCode as u32 == SC_CAPSLOCK && (kb.Flags & RI_KEY_BREAK) != 0 {
+            caps_up();
+        }
+    }
+}
+
+// send a single key event (down or up)
+unsafe fn send_key_event(vk_code: u16, key_up: bool) {
+    unsafe {
+        let mut input: INPUT = std::mem::zeroed();
+        input.r#type = INPUT_KEYBOARD;
+        input.Anonymous.ki = KEYBDINPUT {
+            wVk: vk_code,
+            wScan: 0,
+            dwFlags: if key_up { KEYEVENTF_KEYUP } else { 0 },
+            time: 0,
+            dwExtraInfo: 0,
+        };
+        SendInput(1, &input, size_of::<INPUT>() as i32);
+    }
+}
+
+// send a key event (down and up)
 unsafe fn send_key_press(vk_code: u16) {
     unsafe {
         let mut inputs: [INPUT; 2] = std::mem::zeroed();
