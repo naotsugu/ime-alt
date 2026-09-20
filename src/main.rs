@@ -5,10 +5,9 @@ use windows_sys::Win32::Foundation::{HWND, LPARAM, LRESULT, WPARAM};
 use windows_sys::Win32::Graphics::Gdi::HBRUSH;
 use windows_sys::Win32::System::LibraryLoader::GetModuleHandleW;
 use windows_sys::Win32::UI::Input::KeyboardAndMouse::{
-    SendInput, INPUT, INPUT_KEYBOARD, KEYBDINPUT, KEYEVENTF_KEYUP,
-};
+    SendInput, GetAsyncKeyState, INPUT, KEYBDINPUT, INPUT_KEYBOARD, KEYEVENTF_KEYUP};
 use windows_sys::Win32::UI::Shell::{
-    Shell_NotifyIconW, NIM_ADD, NIM_DELETE, NOTIFYICONDATAW, NIF_ICON, NIF_MESSAGE, NIF_TIP,
+    Shell_NotifyIconW, NOTIFYICONDATAW, NIM_ADD, NIM_DELETE, NIF_ICON, NIF_MESSAGE, NIF_TIP,
 };
 use windows_sys::Win32::UI::WindowsAndMessaging::{
     CallNextHookEx, CreatePopupMenu, CreateWindowExW, DefWindowProcW, DestroyMenu,
@@ -23,6 +22,10 @@ use windows_sys::Win32::UI::WindowsAndMessaging::{
 // virtual key code
 const VK_LMENU:   u32 = 0xA4; // left alt
 const VK_RMENU:   u32 = 0xA5; // right alt
+const VK_CONTROL: i32 = 0x11; // ctrl (either side)
+const VK_SHIFT:   i32 = 0x10; // shift
+const VK_LWIN:    i32 = 0x5B; // left win
+const VK_RWIN:    i32 = 0x5C; // right win
 const VK_IME_OFF: u16 = 0x1A; // ime off
 const VK_IME_ON:  u16 = 0x16; // ime on
 
@@ -215,26 +218,38 @@ unsafe extern "system" fn keyboard_proc(
                 unsafe {
                     if !LALT_PRESSED {
                         // reset combination
-                        IS_COMBINATION = false;
+                        // if modifier is already held, it is a combination from the start
+                        IS_COMBINATION = is_modifier_pressed();
                         // mark left alt key pressed
                         LALT_PRESSED = true;
+                        // Ctrl+Alt: pass the Alt keydown through instead of consuming it
+                        if IS_COMBINATION {
+                            return CallNextHookEx(HOOK_HANDLE, n_code, w_param, l_param);
+                        }
                     }
                 }
                 // consume an event
                 return 1;
+
 
             } else if vk == VK_RMENU {
                 // right alt key
                 unsafe {
                     if !RALT_PRESSED {
                         // reset combination
-                        IS_COMBINATION = false;
+                        // if modifier is already held, it is a combination from the start
+                        IS_COMBINATION = is_modifier_pressed();
                         // mark right alt key pressed
                         RALT_PRESSED = true;
+                        // Ctrl+Alt: pass the Alt keydown through instead of consuming it
+                        if IS_COMBINATION {
+                            return CallNextHookEx(HOOK_HANDLE, n_code, w_param, l_param);
+                        }
                     }
                 }
                 // consume an event
                 return 1;
+
 
             } else {
                 // if another key is pressed while Alt is held down,
@@ -269,7 +284,6 @@ unsafe extern "system" fn keyboard_proc(
         // WM_KEYUP    : the virtual-key code of the nonsystem key
         //               a nonsystem key is a key that is pressed when the ALT key is not pressed
         // WM_SYSKEYUP : the user releases a key that was pressed while the ALT key was held down
-        //               
         if w_param == WM_KEYUP as usize ||
            w_param == WM_SYSKEYUP as usize {
 
@@ -330,6 +344,14 @@ unsafe fn send_key_press(vk_code: u16) {
         // send input event (key down -> up)
         SendInput(2, inputs.as_mut_ptr(), std::mem::size_of::<INPUT>() as i32);
     }
+}
+
+// returns `true` while either Ctrl / Shift / Win key is held down
+// (the most significant bit of GetAsyncKeyState means "currently down")
+unsafe fn is_modifier_pressed() -> bool {
+    [VK_CONTROL, VK_SHIFT, VK_LWIN, VK_RWIN]
+        .iter()
+        .any(|&vk| (unsafe { GetAsyncKeyState(vk) } as u16 & 0x8000) != 0)
 }
 
 // utility for encoding string slice to UTF-16 
