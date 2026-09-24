@@ -48,8 +48,8 @@ const WM_MY_TRAYICON: u32 = WM_USER + 1;
 const WM_CAPS_DONE: u32 = WM_USER + 2;
 // system tray menu item id
 const IDM_EXIT: usize = 1001;
-const IDM_ALT_IME: usize = 1002;   // toggle Alt -> IME switching
-const IDM_CAPS_CTRL: usize = 1003; // toggle CapsLock -> Ctrl (registry)
+const IDM_ALT_IME: usize = 1002;   // toggle Alt -> IME
+const IDM_CAPS_CTRL: usize = 1003; // toggle CapsLock -> Ctrl
 
 // registry: CapsLock -> Ctrl is done with the "Scancode Map" value
 const KEYBOARD_LAYOUT_KEY: &str = r"SYSTEM\CurrentControlSet\Control\Keyboard Layout";
