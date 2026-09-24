@@ -4,7 +4,7 @@
   <img src="https://github.com/naotsugu/ime-alt/blob/main/docs/128x128.png" alt="あlt">
 </p>
 
-A small tool that provides Mac-like IME switching on US-ASCII keyboards.
+A small tool that provides Mac-like IME switching on Windows US-ASCII keyboards.
 
 ## Features
 
