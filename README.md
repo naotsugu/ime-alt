@@ -48,15 +48,11 @@ To enable it, right-click the `ime-alt` icon in the system tray and select **Cap
 
 > [!IMPORTANT]
 > The remapping is done by changing the Scancode Map in the Windows registry
-> (`HKEY_LOCAL_MACHINE\SYSTEM\CurrentControlSet\Control\Keyboard Layout`),
-> not by hooking keyboard events. Therefore:
+> (`HKEY_LOCAL_MACHINE\SYSTEM\CurrentControlSet\Control\Keyboard Layout`), not by hooking keyboard events(Implementing the remapping with a keyboard hook can be unreliable, because key-up events are sometimes not delivered. Changing the Scancode Map in the registry is the most stable approach, since the remapping is handled by Windows itself.).
+> Therefore:
 >
 > - **Administrator access** is required to change the setting.
 > - You need to **sign out** (and sign back in) for the change to take effect.
-
-> [!NOTE] Why the registry instead of a keyboard hook?
-> Implementing the remapping with a keyboard hook can be unreliable, because key-up events are sometimes not delivered.
-> Changing the Scancode Map in the registry is the most stable approach, since the remapping is handled by Windows itself.
 
 
 ## Uninstallation
