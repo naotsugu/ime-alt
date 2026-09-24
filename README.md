@@ -54,7 +54,7 @@ To enable it, right-click the `ime-alt` icon in the system tray and select **Cap
 > - **Administrator access** is required to change the setting.
 > - You need to **sign out** (and sign back in) for the change to take effect.
 >
-> Implementing the remapping with a keyboard hook can be unreliable, because key-up events are sometimes not delivered. Changing the Scancode Map in the registry is the most stable approach, since the remapping is handled by Windows itself.
+> <sub>Implementing the remapping with a keyboard hook can be unreliable, because key-up events are sometimes not delivered. Changing the Scancode Map in the registry is the most stable approach, since the remapping is handled by Windows itself.</sub>
 
 ## Uninstallation
 
