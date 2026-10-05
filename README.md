@@ -39,6 +39,8 @@ To automatically start `ime-alt` when Windows starts, add a shortcut to `ime-alt
 1. Run `ime-alt.exe` to start the application in the background.
 2. To exit the application, right-click its system tray icon and select **Exit**.
 
+![system-tray](docs/system-tray.png)
+
 ## Remapping CapsLock to Ctrl
 
 `ime-alt` can also remap the CapsLock key to Ctrl.
