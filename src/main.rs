@@ -3,7 +3,7 @@
 use std::ptr::{null, null_mut};
 use std::sync::atomic::{AtomicBool, AtomicPtr, Ordering};
 use windows_sys::Win32::Foundation::{
-    CloseHandle, GetLastError, ERROR_ACCESS_DENIED, ERROR_CANCELLED, ERROR_FILE_NOT_FOUND,
+    CloseHandle, GetLastError, ERROR_ACCESS_DENIED, ERROR_ALREADY_EXISTS, ERROR_CANCELLED, ERROR_FILE_NOT_FOUND,
     ERROR_GEN_FAILURE, ERROR_INVALID_PARAMETER, ERROR_SUCCESS, HWND, LPARAM, LRESULT, WPARAM,
 };
 use windows_sys::Win32::Graphics::Gdi::HBRUSH;
@@ -12,13 +12,15 @@ use windows_sys::Win32::System::Registry::{
     RegCloseKey, RegDeleteValueW, RegOpenKeyExW, RegQueryValueExW, RegSetValueExW, HKEY,
     HKEY_LOCAL_MACHINE, KEY_QUERY_VALUE, KEY_SET_VALUE, REG_BINARY,
 };
-use windows_sys::Win32::System::Threading::{GetExitCodeProcess, WaitForSingleObject, INFINITE};
+use windows_sys::Win32::System::Threading::{
+    CreateMutexW, GetExitCodeProcess, WaitForSingleObject, INFINITE,
+};
 use windows_sys::Win32::UI::Input::KeyboardAndMouse::{
     GetAsyncKeyState, SendInput, INPUT, KEYBDINPUT, INPUT_KEYBOARD, KEYEVENTF_KEYUP,
 };
 use windows_sys::Win32::UI::Shell::{
     ShellExecuteExW, Shell_NotifyIconW,
-    NIM_ADD, NIM_DELETE, NIF_ICON, NIF_MESSAGE, NIF_TIP, SEE_MASK_NOCLOSEPROCESS,
+    NIM_ADD, NIM_DELETE, NIF_ICON, NIF_MESSAGE, NIF_TIP, SEE_MASK_NOCLOSEPROCESS, SEE_MASK_NOASYNC,
     NOTIFYICONDATAW, SHELLEXECUTEINFOW,
 };
 use windows_sys::Win32::UI::WindowsAndMessaging::{
@@ -26,7 +28,7 @@ use windows_sys::Win32::UI::WindowsAndMessaging::{
     DestroyMenu, DestroyWindow, DispatchMessageW, GetCursorPos, GetMessageW, MessageBoxW,
     PostMessageW, PostQuitMessage, RegisterClassW, LoadImageW, SetForegroundWindow,
     SetWindowsHookExW, TrackPopupMenu, TranslateMessage, UnhookWindowsHookEx, UnregisterClassW,
-    HHOOK, HCURSOR, HICON, KBDLLHOOKSTRUCT, MSG, WNDCLASSW,
+    HCURSOR, HICON, KBDLLHOOKSTRUCT, MSG, WNDCLASSW,
     TPM_BOTTOMALIGN, TPM_LEFTALIGN, WH_KEYBOARD_LL, WM_COMMAND, WM_DESTROY, WM_KEYDOWN, WM_KEYUP,
     WM_RBUTTONUP, WM_SYSKEYDOWN, WM_SYSKEYUP, WM_USER, LLKHF_INJECTED, IMAGE_ICON,
     LR_DEFAULTCOLOR, LR_DEFAULTSIZE,
@@ -60,8 +62,8 @@ const SC_LCTRL: u16 = 0x1D;
 // command line of the elevated helper process: "--set-caps-ctrl on|off"
 const ARG_SET_CAPS_CTRL: &str = "--set-caps-ctrl";
 
-// Hook handle and keyboard state flags accessed by the keyboard hook and window procedure.
-// Atomic types are used for thread-safe interior mutability without `static mut`.
+// hook handle and keyboard state flags accessed by the keyboard hook and window procedure.
+// atomic types are used for thread-safe interior mutability without `static mut`.
 static HOOK_HANDLE: AtomicPtr<std::ffi::c_void> = AtomicPtr::new(null_mut());
 
 static IS_COMBINATION: AtomicBool = AtomicBool::new(false);
@@ -90,7 +92,18 @@ fn main() {
     }
 
     unsafe {
-
+        // single instance guard:
+        // a second instance would install a second hook, and every Alt press would toggle the IME twice
+        // (the "Local\" prefix makes the name per-session)
+        let mutex_name = encode_utf16(r"Local\ime-alt-single-instance");
+        let mutex = CreateMutexW(null(), 0, mutex_name.as_ptr());
+        // GetLastError must be called right after CreateMutexW
+        if mutex.is_null() || GetLastError() == ERROR_ALREADY_EXISTS {
+            if !mutex.is_null() {
+                CloseHandle(mutex);
+            }
+            return;
+        }
         let h_instance = GetModuleHandleW(null_mut());
 
         // create window class (dummy)
@@ -137,7 +150,7 @@ fn main() {
             0,
             0,
             LR_DEFAULTCOLOR | LR_DEFAULTSIZE,
-        ) as windows_sys::Win32::UI::WindowsAndMessaging::HICON;
+        ) as HICON;
         let mut nid: NOTIFYICONDATAW = std::mem::zeroed();
         nid.cbSize = std::mem::size_of::<NOTIFYICONDATAW>() as u32;
         nid.hWnd = hwnd;
@@ -647,7 +660,7 @@ fn run_elevated_set(enable: bool) -> Result<(), u32> {
 
         let mut sei: SHELLEXECUTEINFOW = std::mem::zeroed();
         sei.cbSize = std::mem::size_of::<SHELLEXECUTEINFOW>() as u32;
-        sei.fMask = SEE_MASK_NOCLOSEPROCESS;
+        sei.fMask = SEE_MASK_NOCLOSEPROCESS | SEE_MASK_NOASYNC; // run synchronously: this thread has no COM apartment
         sei.lpVerb = verb.as_ptr();
         sei.lpFile = path.as_ptr();
         sei.lpParameters = params.as_ptr();
