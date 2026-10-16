@@ -22,10 +22,10 @@ use windows_sys::Win32::UI::Shell::{
     NOTIFYICONDATAW, SHELLEXECUTEINFOW,
 };
 use windows_sys::Win32::UI::WindowsAndMessaging::{
-    AppendMenuW, CallNextHookEx, CreatePopupMenu, CreateWindowExW, DefWindowProcW, DestroyMenu,
-    DispatchMessageW, GetCursorPos, GetMessageW, MessageBoxW, PostMessageW, PostQuitMessage,
-    RegisterClassW, LoadImageW,
-    SetForegroundWindow, SetWindowsHookExW, TrackPopupMenu, TranslateMessage, UnhookWindowsHookEx,
+    AppendMenuW, CallNextHookEx, CreatePopupMenu, CreateWindowExW, DefWindowProcW, DestroyIcon,
+    DestroyMenu, DestroyWindow, DispatchMessageW, GetCursorPos, GetMessageW, MessageBoxW,
+    PostMessageW, PostQuitMessage, RegisterClassW, LoadImageW, SetForegroundWindow,
+    SetWindowsHookExW, TrackPopupMenu, TranslateMessage, UnhookWindowsHookEx, UnregisterClassW,
     HHOOK, HCURSOR, HICON, KBDLLHOOKSTRUCT, MSG, WNDCLASSW,
     TPM_BOTTOMALIGN, TPM_LEFTALIGN, WH_KEYBOARD_LL, WM_COMMAND, WM_DESTROY, WM_KEYDOWN, WM_KEYUP,
     WM_RBUTTONUP, WM_SYSKEYDOWN, WM_SYSKEYUP, WM_USER, LLKHF_INJECTED, IMAGE_ICON,
@@ -123,6 +123,7 @@ fn main() {
         );
         if hwnd.is_null() {
             eprintln!("failed to create window");
+            UnregisterClassW(class_name.as_ptr(), h_instance);
             return;
         }
 
@@ -154,6 +155,11 @@ fn main() {
         if hook.is_null() {
             eprintln!("failed to register the hook");
             Shell_NotifyIconW(NIM_DELETE, &nid);
+            if !h_icon.is_null() {
+                DestroyIcon(h_icon);
+            }
+            DestroyWindow(hwnd);
+            UnregisterClassW(class_name.as_ptr(), h_instance);
             return;
         }
         HOOK_HANDLE.store(hook, Ordering::Relaxed);
@@ -165,9 +171,14 @@ fn main() {
             DispatchMessageW(&msg);
         }
 
-        // clear event hook
+        // clear event hook and cleanup resources
         UnhookWindowsHookEx(HOOK_HANDLE.load(Ordering::Relaxed));
         Shell_NotifyIconW(NIM_DELETE, &nid);
+        if !h_icon.is_null() {
+            DestroyIcon(h_icon);
+        }
+        DestroyWindow(hwnd);
+        UnregisterClassW(class_name.as_ptr(), h_instance);
     }
 }
 
@@ -647,6 +658,9 @@ fn run_elevated_set(enable: bool) -> Result<(), u32> {
 
         // the exit code of the helper is the Win32 error code (0 = success)
         let h_process = sei.hProcess;
+        if h_process.is_null() {
+            return Err(last_error());
+        }
         WaitForSingleObject(h_process, INFINITE);
         let mut code: u32 = 1;
         GetExitCodeProcess(h_process, &mut code);
