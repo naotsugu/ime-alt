@@ -1,7 +1,7 @@
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")] // /SUBSYSTEM:WINDOWS hide console
 
 use std::ptr::{null, null_mut};
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicPtr, Ordering};
 use windows_sys::Win32::Foundation::{
     CloseHandle, GetLastError, ERROR_ACCESS_DENIED, ERROR_CANCELLED, ERROR_FILE_NOT_FOUND,
     ERROR_GEN_FAILURE, ERROR_INVALID_PARAMETER, ERROR_SUCCESS, HWND, LPARAM, LRESULT, WPARAM,
@@ -60,17 +60,16 @@ const SC_LCTRL: u16 = 0x1D;
 // command line of the elevated helper process: "--set-caps-ctrl on|off"
 const ARG_SET_CAPS_CTRL: &str = "--set-caps-ctrl";
 
-// NOTE: the following `static mut` values are only accessed from the main thread
-// (the low-level keyboard hook callback and the window procedure both run on the thread
-// that runs the message loop), so there is no data race.
-static mut HOOK_HANDLE: HHOOK = null_mut();
+// Hook handle and keyboard state flags accessed by the keyboard hook and window procedure.
+// Atomic types are used for thread-safe interior mutability without `static mut`.
+static HOOK_HANDLE: AtomicPtr<std::ffi::c_void> = AtomicPtr::new(null_mut());
 
-static mut IS_COMBINATION: bool = false;
-static mut LALT_PRESSED: bool = false;
-static mut RALT_PRESSED: bool = false;
+static IS_COMBINATION: AtomicBool = AtomicBool::new(false);
+static LALT_PRESSED: AtomicBool = AtomicBool::new(false);
+static RALT_PRESSED: AtomicBool = AtomicBool::new(false);
 
 // Alt -> IME switching on/off (toggled from the tray menu, enabled at startup)
-static mut ALT_IME_ENABLED: bool = true;
+static ALT_IME_ENABLED: AtomicBool = AtomicBool::new(true);
 
 // true while the registry worker thread is running
 static CAPS_JOB_RUNNING: AtomicBool = AtomicBool::new(false);
@@ -157,7 +156,7 @@ fn main() {
             Shell_NotifyIconW(NIM_DELETE, &nid);
             return;
         }
-        HOOK_HANDLE = hook;
+        HOOK_HANDLE.store(hook, Ordering::Relaxed);
 
         // message loop
         let mut msg: MSG = std::mem::zeroed();
@@ -167,7 +166,7 @@ fn main() {
         }
 
         // clear event hook
-        UnhookWindowsHookEx(HOOK_HANDLE);
+        UnhookWindowsHookEx(HOOK_HANDLE.load(Ordering::Relaxed));
         Shell_NotifyIconW(NIM_DELETE, &nid);
     }
 }
@@ -191,7 +190,7 @@ unsafe extern "system" fn window_proc(
                     // add "Alt -> IME" item (checked while enabled)
                     let alt_text = encode_utf16("Alt to IME");
                     let alt_flags = MF_STRING
-                        | if ALT_IME_ENABLED { MF_CHECKED } else { MF_UNCHECKED };
+                        | if ALT_IME_ENABLED.load(Ordering::Relaxed) { MF_CHECKED } else { MF_UNCHECKED };
                     AppendMenuW(h_menu, alt_flags, IDM_ALT_IME, alt_text.as_ptr());
 
                     // add "CapsLock -> Ctrl" item
@@ -241,12 +240,13 @@ unsafe extern "system" fn window_proc(
                 IDM_EXIT => unsafe { PostQuitMessage(0); },
 
                 // toggle Alt -> IME switching
-                IDM_ALT_IME => unsafe {
-                    ALT_IME_ENABLED = !ALT_IME_ENABLED;
+                IDM_ALT_IME => {
+                    let current = ALT_IME_ENABLED.load(Ordering::Relaxed);
+                    ALT_IME_ENABLED.store(!current, Ordering::Relaxed);
                     // do not leave a half-processed Alt press behind
-                    IS_COMBINATION = false;
-                    LALT_PRESSED = false;
-                    RALT_PRESSED = false;
+                    IS_COMBINATION.store(false, Ordering::Relaxed);
+                    LALT_PRESSED.store(false, Ordering::Relaxed);
+                    RALT_PRESSED.store(false, Ordering::Relaxed);
                 },
 
                 // toggle CapsLock -> Ctrl (writes the registry in a worker thread)
@@ -316,12 +316,12 @@ unsafe extern "system" fn keyboard_proc(
         // LLKHF_INJECTED : specifies whether the event was injected programmatically
         //                  (e.g., via the SendInput function)
         if (kbd_struct.flags & LLKHF_INJECTED) != 0 {
-            return unsafe { CallNextHookEx(HOOK_HANDLE, n_code, w_param, l_param) };
+            return unsafe { CallNextHookEx(HOOK_HANDLE.load(Ordering::Relaxed), n_code, w_param, l_param) };
         }
 
         // Alt -> IME switching is turned off from the tray menu: do nothing
-        if unsafe { !ALT_IME_ENABLED } {
-            return unsafe { CallNextHookEx(HOOK_HANDLE, n_code, w_param, l_param) };
+        if !ALT_IME_ENABLED.load(Ordering::Relaxed) {
+            return unsafe { CallNextHookEx(HOOK_HANDLE.load(Ordering::Relaxed), n_code, w_param, l_param) };
         }
 
         let vk = kbd_struct.vkCode;
@@ -336,17 +336,16 @@ unsafe extern "system" fn keyboard_proc(
 
             if vk == VK_LMENU {
                 // left alt key
-                unsafe {
-                    if !LALT_PRESSED {
-                        // reset combination
-                        // if another key is already held, it is a combination from the start
-                        IS_COMBINATION = is_other_key_pressed();
-                        // mark left alt key pressed
-                        LALT_PRESSED = true;
-                        // another key is held: pass the Alt keydown through instead of consuming it
-                        if IS_COMBINATION {
-                            return CallNextHookEx(HOOK_HANDLE, n_code, w_param, l_param);
-                        }
+                if !LALT_PRESSED.load(Ordering::Relaxed) {
+                    // reset combination
+                    // if another key is already held, it is a combination from the start
+                    let comb = is_other_key_pressed();
+                    IS_COMBINATION.store(comb, Ordering::Relaxed);
+                    // mark left alt key pressed
+                    LALT_PRESSED.store(true, Ordering::Relaxed);
+                    // another key is held: pass the Alt keydown through instead of consuming it
+                    if comb {
+                        return unsafe { CallNextHookEx(HOOK_HANDLE.load(Ordering::Relaxed), n_code, w_param, l_param) };
                     }
                 }
                 // consume an event
@@ -354,17 +353,16 @@ unsafe extern "system" fn keyboard_proc(
 
             } else if vk == VK_RMENU {
                 // right alt key
-                unsafe {
-                    if !RALT_PRESSED {
-                        // reset combination
-                        // if another key is already held, it is a combination from the start
-                        IS_COMBINATION = is_other_key_pressed();
-                        // mark right alt key pressed
-                        RALT_PRESSED = true;
-                        // another key is held: pass the Alt keydown through instead of consuming it
-                        if IS_COMBINATION {
-                            return CallNextHookEx(HOOK_HANDLE, n_code, w_param, l_param);
-                        }
+                if !RALT_PRESSED.load(Ordering::Relaxed) {
+                    // reset combination
+                    // if another key is already held, it is a combination from the start
+                    let comb = is_other_key_pressed();
+                    IS_COMBINATION.store(comb, Ordering::Relaxed);
+                    // mark right alt key pressed
+                    RALT_PRESSED.store(true, Ordering::Relaxed);
+                    // another key is held: pass the Alt keydown through instead of consuming it
+                    if comb {
+                        return unsafe { CallNextHookEx(HOOK_HANDLE.load(Ordering::Relaxed), n_code, w_param, l_param) };
                     }
                 }
                 // consume an event
@@ -373,17 +371,19 @@ unsafe extern "system" fn keyboard_proc(
             } else {
                 // if another key is pressed while Alt is held down,
                 // it is considered a combination
-                unsafe {
-                    if LALT_PRESSED || RALT_PRESSED {
-                        IS_COMBINATION = true;
+                let lalt = LALT_PRESSED.load(Ordering::Relaxed);
+                let ralt = RALT_PRESSED.load(Ordering::Relaxed);
+                if lalt || ralt {
+                    IS_COMBINATION.store(true, Ordering::Relaxed);
 
-                        // for a key combination, immediately re-fire Alt keydown
-                        // to trigger the native shortcut (e.g., Alt+Tab)
-                        let active_alt = if LALT_PRESSED {
-                            VK_LMENU as u16
-                        } else {
-                            VK_RMENU as u16
-                        };
+                    // for a key combination, immediately re-fire Alt keydown
+                    // to trigger the native shortcut (e.g., Alt+Tab)
+                    let active_alt = if lalt {
+                        VK_LMENU as u16
+                    } else {
+                        VK_RMENU as u16
+                    };
+                    unsafe {
                         let mut inputs: [INPUT; 1] = std::mem::zeroed();
                         inputs[0].r#type = INPUT_KEYBOARD;
                         inputs[0].Anonymous.ki = KEYBDINPUT {
@@ -408,13 +408,11 @@ unsafe extern "system" fn keyboard_proc(
 
             if vk == VK_LMENU || vk == VK_RMENU {
 
-                let was_combination = unsafe { IS_COMBINATION };
+                let was_combination = IS_COMBINATION.load(Ordering::Relaxed);
 
                 // clear stat
-                unsafe {
-                    if vk == VK_LMENU { LALT_PRESSED = false; }
-                    if vk == VK_RMENU { RALT_PRESSED = false; }
-                }
+                if vk == VK_LMENU { LALT_PRESSED.store(false, Ordering::Relaxed); }
+                if vk == VK_RMENU { RALT_PRESSED.store(false, Ordering::Relaxed); }
 
                 // toggle the IME only on a single press of the alt key
                 if !was_combination {
@@ -432,7 +430,7 @@ unsafe extern "system" fn keyboard_proc(
         }
     }
 
-    unsafe { CallNextHookEx(HOOK_HANDLE, n_code, w_param, l_param) }
+    unsafe { CallNextHookEx(HOOK_HANDLE.load(Ordering::Relaxed), n_code, w_param, l_param) }
 }
 
 
