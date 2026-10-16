@@ -1,7 +1,7 @@
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")] // /SUBSYSTEM:WINDOWS hide console
 
 use std::ptr::{null, null_mut};
-use std::sync::atomic::{AtomicBool, AtomicPtr, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicPtr, AtomicU32, Ordering};
 use windows_sys::Win32::Foundation::{
     CloseHandle, GetLastError, ERROR_ACCESS_DENIED, ERROR_ALREADY_EXISTS, ERROR_CANCELLED, ERROR_FILE_NOT_FOUND,
     ERROR_GEN_FAILURE, ERROR_INVALID_PARAMETER, ERROR_SUCCESS, HWND, LPARAM, LRESULT, WPARAM,
@@ -26,8 +26,9 @@ use windows_sys::Win32::UI::Shell::{
 use windows_sys::Win32::UI::WindowsAndMessaging::{
     AppendMenuW, CallNextHookEx, CreatePopupMenu, CreateWindowExW, DefWindowProcW, DestroyIcon,
     DestroyMenu, DestroyWindow, DispatchMessageW, GetCursorPos, GetMessageW, MessageBoxW,
-    PostMessageW, PostQuitMessage, RegisterClassW, LoadImageW, SetForegroundWindow,
-    SetWindowsHookExW, TrackPopupMenu, TranslateMessage, UnhookWindowsHookEx, UnregisterClassW,
+    PostMessageW, PostQuitMessage, RegisterClassW,  RegisterWindowMessageW, LoadImageW,
+    SetForegroundWindow, SetWindowsHookExW, TrackPopupMenu, TranslateMessage,
+    UnhookWindowsHookEx, UnregisterClassW,
     HCURSOR, HICON, KBDLLHOOKSTRUCT, MSG, WNDCLASSW,
     TPM_BOTTOMALIGN, TPM_LEFTALIGN, WH_KEYBOARD_LL, WM_COMMAND, WM_DESTROY, WM_KEYDOWN, WM_KEYUP,
     WM_RBUTTONUP, WM_SYSKEYDOWN, WM_SYSKEYUP, WM_USER, LLKHF_INJECTED, IMAGE_ICON,
@@ -65,6 +66,11 @@ const ARG_SET_CAPS_CTRL: &str = "--set-caps-ctrl";
 // hook handle and keyboard state flags accessed by the keyboard hook and window procedure.
 // atomic types are used for thread-safe interior mutability without `static mut`.
 static HOOK_HANDLE: AtomicPtr<std::ffi::c_void> = AtomicPtr::new(null_mut());
+
+// tray icon handle, needed to re-add the icon from the window procedure
+static TRAY_ICON: AtomicPtr<std::ffi::c_void> = AtomicPtr::new(null_mut());
+// registered message id of "TaskbarCreated" (broadcast when Explorer restarts)
+static WM_TASKBAR_CREATED: AtomicU32 = AtomicU32::new(0);
 
 static IS_COMBINATION: AtomicBool = AtomicBool::new(false);
 static LALT_PRESSED: AtomicBool = AtomicBool::new(false);
@@ -108,6 +114,11 @@ fn main() {
 
         // create window class (dummy)
         let class_name = encode_utf16("ImeAltClass");
+
+        // register before the window is created, so that no broadcast is missed
+        let taskbar_created = RegisterWindowMessageW(encode_utf16("TaskbarCreated").as_ptr());
+        WM_TASKBAR_CREATED.store(taskbar_created, Ordering::Relaxed);
+
         let wnd_class = WNDCLASSW {
             style: 0,
             lpfnWndProc: Some(window_proc),
@@ -151,23 +162,25 @@ fn main() {
             0,
             LR_DEFAULTCOLOR | LR_DEFAULTSIZE,
         ) as HICON;
-        let mut nid: NOTIFYICONDATAW = std::mem::zeroed();
-        nid.cbSize = std::mem::size_of::<NOTIFYICONDATAW>() as u32;
-        nid.hWnd = hwnd;
-        nid.uID = 1;
-        nid.uFlags = NIF_ICON | NIF_MESSAGE | NIF_TIP;
-        nid.uCallbackMessage = WM_MY_TRAYICON;
-        nid.hIcon = h_icon;
-        let tip = encode_utf16("ime-alt");
-        let copy_len = tip.len().min(nid.szTip.len() - 1);
-        nid.szTip[..copy_len].copy_from_slice(&tip[..copy_len]);
-        Shell_NotifyIconW(NIM_ADD, &nid);
+        // let mut nid: NOTIFYICONDATAW = std::mem::zeroed();
+        // nid.cbSize = std::mem::size_of::<NOTIFYICONDATAW>() as u32;
+        // nid.hWnd = hwnd;
+        // nid.uID = 1;
+        // nid.uFlags = NIF_ICON | NIF_MESSAGE | NIF_TIP;
+        // nid.uCallbackMessage = WM_MY_TRAYICON;
+        // nid.hIcon = h_icon;
+        // let tip = encode_utf16("ime-alt");
+        // let copy_len = tip.len().min(nid.szTip.len() - 1);
+        // nid.szTip[..copy_len].copy_from_slice(&tip[..copy_len]);
+        // Shell_NotifyIconW(NIM_ADD, &nid);
+        TRAY_ICON.store(h_icon, Ordering::Relaxed);
+        add_tray_icon(hwnd, h_icon);
 
         // register keybord hook
         let hook = SetWindowsHookExW(WH_KEYBOARD_LL, Some(keyboard_proc), h_instance, 0);
         if hook.is_null() {
             eprintln!("failed to register the hook");
-            Shell_NotifyIconW(NIM_DELETE, &nid);
+            remove_tray_icon(hwnd);
             if !h_icon.is_null() {
                 DestroyIcon(h_icon);
             }
@@ -186,7 +199,7 @@ fn main() {
 
         // clear event hook and cleanup resources
         UnhookWindowsHookEx(HOOK_HANDLE.load(Ordering::Relaxed));
-        Shell_NotifyIconW(NIM_DELETE, &nid);
+        remove_tray_icon(hwnd);
         if !h_icon.is_null() {
             DestroyIcon(h_icon);
         }
@@ -316,6 +329,11 @@ unsafe extern "system" fn window_proc(
             // clear the flag after the message box is closed,
             // so that the menu item stays disabled while the box is shown
             CAPS_JOB_RUNNING.store(false, Ordering::SeqCst);
+            0
+        }
+        // Explorer was restarted and the taskbar was recreated: the tray icon is gone, add it again
+        m if m != 0 && m == WM_TASKBAR_CREATED.load(Ordering::Relaxed) => {
+            unsafe { add_tray_icon(hwnd, TRAY_ICON.load(Ordering::Relaxed) as HICON); }
             0
         }
         WM_DESTROY => {
@@ -712,6 +730,33 @@ fn start_caps_ctrl_job(hwnd: HWND, enable: bool) {
     });
 }
 
+// add the tray icon (also used to restore it after Explorer restarts)
+unsafe fn add_tray_icon(hwnd: HWND, h_icon: HICON) -> bool {
+    unsafe {
+        let mut nid: NOTIFYICONDATAW = std::mem::zeroed();
+        nid.cbSize = std::mem::size_of::<NOTIFYICONDATAW>() as u32;
+        nid.hWnd = hwnd;
+        nid.uID = 1;
+        nid.uFlags = NIF_ICON | NIF_MESSAGE | NIF_TIP;
+        nid.uCallbackMessage = WM_MY_TRAYICON;
+        nid.hIcon = h_icon;
+        let tip = encode_utf16("ime-alt");
+        let copy_len = tip.len().min(nid.szTip.len() - 1);
+        nid.szTip[..copy_len].copy_from_slice(&tip[..copy_len]);
+        Shell_NotifyIconW(NIM_ADD, &nid) != 0
+    }
+}
+
+// remove the tray icon (NIM_DELETE only needs cbSize, hWnd and uID)
+unsafe fn remove_tray_icon(hwnd: HWND) {
+    unsafe {
+        let mut nid: NOTIFYICONDATAW = std::mem::zeroed();
+        nid.cbSize = std::mem::size_of::<NOTIFYICONDATAW>() as u32;
+        nid.hWnd = hwnd;
+        nid.uID = 1;
+        Shell_NotifyIconW(NIM_DELETE, &nid);
+    }
+}
 
 // utility for encoding string slice to UTF-16
 fn encode_utf16(s: &str) -> Vec<u16> {
