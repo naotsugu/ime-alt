@@ -33,7 +33,7 @@ use windows_sys::Win32::UI::WindowsAndMessaging::{
     TPM_BOTTOMALIGN, TPM_LEFTALIGN, WH_KEYBOARD_LL, WM_COMMAND, WM_DESTROY, WM_KEYDOWN, WM_KEYUP,
     WM_RBUTTONUP, WM_SYSKEYDOWN, WM_SYSKEYUP, WM_USER, LLKHF_INJECTED, IMAGE_ICON,
     LR_DEFAULTCOLOR, LR_DEFAULTSIZE,
-    MB_ICONERROR, MB_ICONINFORMATION, MB_ICONWARNING, MB_OK, MB_SETFOREGROUND,
+    MB_ICONERROR, MB_ICONINFORMATION, MB_ICONWARNING, MB_OK, MB_SETFOREGROUND, WM_NULL,
     MF_CHECKED, MF_GRAYED, MF_SEPARATOR, MF_STRING, MF_UNCHECKED, SW_HIDE,
 };
 
@@ -162,21 +162,10 @@ fn main() {
             0,
             LR_DEFAULTCOLOR | LR_DEFAULTSIZE,
         ) as HICON;
-        // let mut nid: NOTIFYICONDATAW = std::mem::zeroed();
-        // nid.cbSize = std::mem::size_of::<NOTIFYICONDATAW>() as u32;
-        // nid.hWnd = hwnd;
-        // nid.uID = 1;
-        // nid.uFlags = NIF_ICON | NIF_MESSAGE | NIF_TIP;
-        // nid.uCallbackMessage = WM_MY_TRAYICON;
-        // nid.hIcon = h_icon;
-        // let tip = encode_utf16("ime-alt");
-        // let copy_len = tip.len().min(nid.szTip.len() - 1);
-        // nid.szTip[..copy_len].copy_from_slice(&tip[..copy_len]);
-        // Shell_NotifyIconW(NIM_ADD, &nid);
         TRAY_ICON.store(h_icon, Ordering::Relaxed);
         add_tray_icon(hwnd, h_icon);
 
-        // register keybord hook
+        // register keyboard hook
         let hook = SetWindowsHookExW(WH_KEYBOARD_LL, Some(keyboard_proc), h_instance, 0);
         if hook.is_null() {
             eprintln!("failed to register the hook");
@@ -265,6 +254,9 @@ unsafe extern "system" fn window_proc(
                         hwnd,
                         null_mut(),
                     );
+                    // required for tray popup menus: without this, the menu may not close
+                    // correctly on the next click (see KB135788)
+                    PostMessageW(hwnd, WM_NULL, 0, 0);
 
                     DestroyMenu(h_menu);
                 }
@@ -272,7 +264,8 @@ unsafe extern "system" fn window_proc(
             0
         }
         WM_COMMAND => {
-            match w_param {
+            // the low word of wParam is the command id (the high word is the notification code)
+            match w_param & 0xFFFF {
                 // terminate the message loop if Exit is selected
                 IDM_EXIT => unsafe { PostQuitMessage(0); },
 
@@ -578,15 +571,19 @@ fn read_scancode_map() -> Result<Option<Vec<u8>>, u32> {
 
         let value_name = encode_utf16(SCANCODE_MAP_VALUE);
         let mut size: u32 = 0;
+        let mut value_type: u32 = 0;
 
         // first call: get the required size
         let rc = RegQueryValueExW(
-            hkey, value_name.as_ptr(), null(), null_mut(), null_mut(), &mut size,
+            hkey, value_name.as_ptr(), null(), &mut value_type, null_mut(), &mut size,
         );
         let result = if rc == ERROR_FILE_NOT_FOUND {
             Ok(None)
         } else if rc != ERROR_SUCCESS {
             Err(rc)
+        } else if value_type != REG_BINARY {
+            // not a binary value: do not try to parse it as a Scancode Map
+            Ok(None)
         } else {
             // second call: read the data
             let mut buf = vec![0u8; size as usize];
