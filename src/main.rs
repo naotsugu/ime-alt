@@ -1,7 +1,7 @@
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")] // /SUBSYSTEM:WINDOWS hide console
 
 use std::ptr::{null, null_mut};
-use std::sync::atomic::{AtomicBool, AtomicPtr, AtomicU32, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicPtr, AtomicU32, AtomicU64, Ordering};
 use windows_sys::Win32::Foundation::{
     CloseHandle, GetLastError, ERROR_ACCESS_DENIED, ERROR_ALREADY_EXISTS, ERROR_CANCELLED, ERROR_FILE_NOT_FOUND,
     ERROR_GEN_FAILURE, ERROR_INVALID_PARAMETER, ERROR_SUCCESS, HWND, LPARAM, LRESULT, WPARAM,
@@ -12,11 +12,14 @@ use windows_sys::Win32::System::Registry::{
     RegCloseKey, RegDeleteValueW, RegOpenKeyExW, RegQueryValueExW, RegSetValueExW, HKEY,
     HKEY_LOCAL_MACHINE, KEY_QUERY_VALUE, KEY_SET_VALUE, REG_BINARY,
 };
+use windows_sys::Win32::System::RemoteDesktop::{
+    WTSRegisterSessionNotification, WTSUnRegisterSessionNotification,
+};
 use windows_sys::Win32::System::Threading::{
     CreateMutexW, GetExitCodeProcess, WaitForSingleObject, INFINITE,
 };
 use windows_sys::Win32::UI::Input::KeyboardAndMouse::{
-    GetAsyncKeyState, SendInput, INPUT, KEYBDINPUT, INPUT_KEYBOARD, KEYEVENTF_KEYUP,
+    SendInput, INPUT, KEYBDINPUT, INPUT_KEYBOARD, KEYEVENTF_KEYUP,
 };
 use windows_sys::Win32::UI::Shell::{
     ShellExecuteExW, Shell_NotifyIconW,
@@ -40,7 +43,6 @@ use windows_sys::Win32::UI::WindowsAndMessaging::{
 // virtual key code
 const VK_LMENU:   u32 = 0xA4; // left alt
 const VK_RMENU:   u32 = 0xA5; // right alt
-const VK_MENU:    i32 = 0x12; // alt (either side)
 const VK_IME_OFF: u16 = 0x1A; // ime off
 const VK_IME_ON:  u16 = 0x16; // ime on
 
@@ -49,6 +51,12 @@ const WM_MY_TRAYICON: u32 = WM_USER + 1;
 // custom window message posted by the registry worker thread when it finishes
 // (wParam: Win32 error code, 0 = success / lParam: 1 = enabled, 0 = disabled)
 const WM_CAPS_DONE: u32 = WM_USER + 2;
+// session change notification (sent when the session is locked / unlocked)
+const WM_WTSSESSION_CHANGE: u32 = 0x02B1;
+const WTS_SESSION_LOCK: usize = 0x7;
+const WTS_SESSION_UNLOCK: usize = 0x8;
+const NOTIFY_FOR_THIS_SESSION: u32 = 0;
+
 // system tray menu item id
 const IDM_EXIT: usize = 1001;
 const IDM_ALT_IME: usize = 1002;   // toggle Alt -> IME
@@ -72,9 +80,23 @@ static TRAY_ICON: AtomicPtr<std::ffi::c_void> = AtomicPtr::new(null_mut());
 // registered message id of "TaskbarCreated" (broadcast when Explorer restarts)
 static WM_TASKBAR_CREATED: AtomicU32 = AtomicU32::new(0);
 
-static IS_COMBINATION: AtomicBool = AtomicBool::new(false);
 static LALT_PRESSED: AtomicBool = AtomicBool::new(false);
 static RALT_PRESSED: AtomicBool = AtomicBool::new(false);
+
+// per-side state of "the Alt key was passed through to the OS" (combination use).
+// it must be kept per side, otherwise LAlt and RAlt overwrite each other
+static LALT_COMB: AtomicBool = AtomicBool::new(false);
+static RALT_COMB: AtomicBool = AtomicBool::new(false);
+
+// keys currently held (virtual-key code bitmap, 256 bits), tracked only from real
+// (non-injected) hook events. GetAsyncKeyState is not used because a stuck key
+// state survives an application restart
+static KEYS_DOWN: [AtomicU64; 4] = [
+    AtomicU64::new(0),
+    AtomicU64::new(0),
+    AtomicU64::new(0),
+    AtomicU64::new(0),
+];
 
 // Alt -> IME switching on/off (toggled from the tray menu, enabled at startup)
 static ALT_IME_ENABLED: AtomicBool = AtomicBool::new(true);
@@ -104,7 +126,19 @@ fn main() {
         let mutex_name = encode_utf16(r"Local\ime-alt-single-instance");
         let mutex = CreateMutexW(null(), 0, mutex_name.as_ptr());
         // GetLastError must be called right after CreateMutexW
-        if mutex.is_null() || GetLastError() == ERROR_ALREADY_EXISTS {
+        let mutex_error = GetLastError();
+        if mutex.is_null() || mutex_error == ERROR_ALREADY_EXISTS {
+            // there is no console (Windows subsystem), so tell the user with a dialog
+            let text = if mutex.is_null() {
+                format!("Failed to create the single instance mutex. (error code: {})", mutex_error)
+            } else {
+                "ime-alt is already running.\nCheck the system tray or the task manager.".to_string()
+            };
+            let icon = if mutex.is_null() { MB_ICONERROR } else { MB_ICONINFORMATION };
+            let text_w = encode_utf16(&text);
+            let title_w = encode_utf16("ime-alt");
+            MessageBoxW(null_mut(), text_w.as_ptr(), title_w.as_ptr(), MB_OK | icon | MB_SETFOREGROUND);
+
             if !mutex.is_null() {
                 CloseHandle(mutex);
             }
@@ -165,6 +199,9 @@ fn main() {
         TRAY_ICON.store(h_icon, Ordering::Relaxed);
         add_tray_icon(hwnd, h_icon);
 
+        // get lock / unlock notifications of this session
+        WTSRegisterSessionNotification(hwnd, NOTIFY_FOR_THIS_SESSION);
+
         // register keyboard hook
         let hook = SetWindowsHookExW(WH_KEYBOARD_LL, Some(keyboard_proc), h_instance, 0);
         if hook.is_null() {
@@ -173,6 +210,7 @@ fn main() {
             if !h_icon.is_null() {
                 DestroyIcon(h_icon);
             }
+            WTSUnRegisterSessionNotification(hwnd);
             DestroyWindow(hwnd);
             UnregisterClassW(class_name.as_ptr(), h_instance);
             return;
@@ -192,6 +230,7 @@ fn main() {
         if !h_icon.is_null() {
             DestroyIcon(h_icon);
         }
+        WTSUnRegisterSessionNotification(hwnd);
         DestroyWindow(hwnd);
         UnregisterClassW(class_name.as_ptr(), h_instance);
     }
@@ -274,9 +313,11 @@ unsafe extern "system" fn window_proc(
                     let current = ALT_IME_ENABLED.load(Ordering::Relaxed);
                     ALT_IME_ENABLED.store(!current, Ordering::Relaxed);
                     // do not leave a half-processed Alt press behind
-                    IS_COMBINATION.store(false, Ordering::Relaxed);
+                    LALT_COMB.store(false, Ordering::Relaxed);
+                    RALT_COMB.store(false, Ordering::Relaxed);
                     LALT_PRESSED.store(false, Ordering::Relaxed);
                     RALT_PRESSED.store(false, Ordering::Relaxed);
+                    clear_keys();
                 },
 
                 // toggle CapsLock -> Ctrl (writes the registry in a worker thread)
@@ -324,6 +365,14 @@ unsafe extern "system" fn window_proc(
             CAPS_JOB_RUNNING.store(false, Ordering::SeqCst);
             0
         }
+        // the session was locked / unlocked: key up events may have been lost
+        // (e.g. Ctrl+Alt+Del), so forget the recorded keys
+        WM_WTSSESSION_CHANGE => {
+            if w_param == WTS_SESSION_LOCK || w_param == WTS_SESSION_UNLOCK {
+                clear_keys();
+            }
+            0
+        }
         // Explorer was restarted and the taskbar was recreated: the tray icon is gone, add it again
         m if m != 0 && m == WM_TASKBAR_CREATED.load(Ordering::Relaxed) => {
             unsafe { add_tray_icon(hwnd, TRAY_ICON.load(Ordering::Relaxed) as HICON); }
@@ -354,28 +403,39 @@ unsafe extern "system" fn keyboard_proc(
             return unsafe { CallNextHookEx(HOOK_HANDLE.load(Ordering::Relaxed), n_code, w_param, l_param) };
         }
 
+        let vk = kbd_struct.vkCode;
+        let is_down = w_param == WM_KEYDOWN as usize || w_param == WM_SYSKEYDOWN as usize;
+        let is_up = w_param == WM_KEYUP as usize || w_param == WM_SYSKEYUP as usize;
+
+        // record the state of the keys other than Alt from real events.
+        // this is done even while Alt -> IME is turned off, so the record stays in sync
+        if vk != VK_LMENU && vk != VK_RMENU {
+            if is_down {
+                set_key(vk, true);
+            } else if is_up {
+                set_key(vk, false);
+            }
+        }
+
         // Alt -> IME switching is turned off from the tray menu: do nothing
         if !ALT_IME_ENABLED.load(Ordering::Relaxed) {
             return unsafe { CallNextHookEx(HOOK_HANDLE.load(Ordering::Relaxed), n_code, w_param, l_param) };
         }
-
-        let vk = kbd_struct.vkCode;
 
         // key down
         // WM_KEYDOWN    : the virtual-key code of the nonsystem key
         //                 A nonsystem key is a key that is pressed when the ALT key is not pressed
         // WM_SYSKEYDOWN : the virtual-key code of the key being pressed
         //                 F10 key (which activates the menu bar) or holds down the ALT key and then presses another key
-        if w_param == WM_KEYDOWN as usize ||
-            w_param == WM_SYSKEYDOWN as usize {
+        if is_down {
 
             if vk == VK_LMENU {
                 // left alt key
                 if !LALT_PRESSED.load(Ordering::Relaxed) {
-                    // reset combination
+                    // reset combination of this side
                     // if another key is already held, it is a combination from the start
                     let comb = is_other_key_pressed();
-                    IS_COMBINATION.store(comb, Ordering::Relaxed);
+                    LALT_COMB.store(comb, Ordering::Relaxed);
                     // mark left alt key pressed
                     LALT_PRESSED.store(true, Ordering::Relaxed);
                     // another key is held: pass the Alt keydown through instead of consuming it
@@ -389,10 +449,10 @@ unsafe extern "system" fn keyboard_proc(
             } else if vk == VK_RMENU {
                 // right alt key
                 if !RALT_PRESSED.load(Ordering::Relaxed) {
-                    // reset combination
+                    // reset combination of this side
                     // if another key is already held, it is a combination from the start
                     let comb = is_other_key_pressed();
-                    IS_COMBINATION.store(comb, Ordering::Relaxed);
+                    RALT_COMB.store(comb, Ordering::Relaxed);
                     // mark right alt key pressed
                     RALT_PRESSED.store(true, Ordering::Relaxed);
                     // another key is held: pass the Alt keydown through instead of consuming it
@@ -405,11 +465,12 @@ unsafe extern "system" fn keyboard_proc(
 
             } else {
                 // if another key is pressed while Alt is held down,
-                // it is considered a combination
+                // it is considered a combination (of every Alt key being held)
                 let lalt = LALT_PRESSED.load(Ordering::Relaxed);
                 let ralt = RALT_PRESSED.load(Ordering::Relaxed);
                 if lalt || ralt {
-                    IS_COMBINATION.store(true, Ordering::Relaxed);
+                    if lalt { LALT_COMB.store(true, Ordering::Relaxed); }
+                    if ralt { RALT_COMB.store(true, Ordering::Relaxed); }
 
                     // for a key combination, immediately re-fire Alt keydown
                     // to trigger the native shortcut (e.g., Alt+Tab)
@@ -438,16 +499,27 @@ unsafe extern "system" fn keyboard_proc(
         // WM_KEYUP    : the virtual-key code of the nonsystem key
         //               a nonsystem key is a key that is pressed when the ALT key is not pressed
         // WM_SYSKEYUP : the user releases a key that was pressed while the ALT key was held down
-        if w_param == WM_KEYUP as usize ||
-            w_param == WM_SYSKEYUP as usize {
+        if is_up {
 
             if vk == VK_LMENU || vk == VK_RMENU {
 
-                let was_combination = IS_COMBINATION.load(Ordering::Relaxed);
+                // whether the keydown of THIS side was passed through to the OS.
+                // if it was, the keyup must be passed through too, otherwise the OS keeps the Alt held
+                let was_combination = if vk == VK_LMENU {
+                    LALT_COMB.load(Ordering::Relaxed)
+                } else {
+                    RALT_COMB.load(Ordering::Relaxed)
+                };
 
-                // clear stat
-                if vk == VK_LMENU { LALT_PRESSED.store(false, Ordering::Relaxed); }
-                if vk == VK_RMENU { RALT_PRESSED.store(false, Ordering::Relaxed); }
+                // clear state
+                if vk == VK_LMENU {
+                    LALT_PRESSED.store(false, Ordering::Relaxed);
+                    LALT_COMB.store(false, Ordering::Relaxed);
+                }
+                if vk == VK_RMENU {
+                    RALT_PRESSED.store(false, Ordering::Relaxed);
+                    RALT_COMB.store(false, Ordering::Relaxed);
+                }
 
                 // toggle the IME only on a single press of the alt key
                 if !was_combination {
@@ -468,20 +540,28 @@ unsafe extern "system" fn keyboard_proc(
     unsafe { CallNextHookEx(HOOK_HANDLE.load(Ordering::Relaxed), n_code, w_param, l_param) }
 }
 
-
-// returns true if any key other than Alt is currently held down
-// (the most significant bit of GetAsyncKeyState means "currently down")
-fn is_other_key_pressed() -> bool {
-    // 0x01..=0x07 are mouse buttons, so start from 0x08 (the first keyboard key)
-    (0x08..=0xFE_i32).any(|vk| {
-        // skip the Alt keys (generic, left, right)
-        if vk == VK_MENU || vk == VK_LMENU as i32 || vk == VK_RMENU as i32 {
-            return false;
-        }
-        (unsafe { GetAsyncKeyState(vk) } as u16 & 0x8000) != 0
-    })
+// record a key down / up event (Alt keys are not recorded)
+fn set_key(vk: u32, down: bool) {
+    let idx = (vk as usize / 64) & 3;
+    let bit = 1u64 << (vk % 64);
+    if down {
+        KEYS_DOWN[idx].fetch_or(bit, Ordering::Relaxed);
+    } else {
+        KEYS_DOWN[idx].fetch_and(!bit, Ordering::Relaxed);
+    }
 }
 
+// forget all recorded keys (used when the state may be out of sync)
+fn clear_keys() {
+    for k in KEYS_DOWN.iter() {
+        k.store(0, Ordering::Relaxed);
+    }
+}
+
+// returns true if any key other than Alt is currently held down
+fn is_other_key_pressed() -> bool {
+    KEYS_DOWN.iter().any(|k| k.load(Ordering::Relaxed) != 0)
+}
 
 unsafe fn send_key_press(vk_code: u16) {
     unsafe {
