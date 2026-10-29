@@ -16,7 +16,8 @@ use windows_sys::Win32::System::RemoteDesktop::{
     WTSRegisterSessionNotification, WTSUnRegisterSessionNotification,
 };
 use windows_sys::Win32::System::Threading::{
-    CreateMutexW, GetExitCodeProcess, WaitForSingleObject, INFINITE,
+    CreateMutexW, GetExitCodeProcess, OpenProcess, WaitForSingleObject, INFINITE,
+    PROCESS_SYNCHRONIZE,
 };
 use windows_sys::Win32::UI::Input::KeyboardAndMouse::{
     SendInput, INPUT, KEYBDINPUT, INPUT_KEYBOARD, KEYEVENTF_KEYUP,
@@ -61,6 +62,7 @@ const NOTIFY_FOR_THIS_SESSION: u32 = 0;
 const IDM_EXIT: usize = 1001;
 const IDM_ALT_IME: usize = 1002;   // toggle Alt -> IME
 const IDM_CAPS_CTRL: usize = 1003; // toggle CapsLock -> Ctrl
+const IDM_RESTART: usize = 1004;   // restart this application
 
 // registry: CapsLock -> Ctrl is done with the "Scancode Map" value
 const KEYBOARD_LAYOUT_KEY: &str = r"SYSTEM\CurrentControlSet\Control\Keyboard Layout";
@@ -70,6 +72,9 @@ const SC_LCTRL: u16 = 0x1D;
 
 // command line of the elevated helper process: "--set-caps-ctrl on|off"
 const ARG_SET_CAPS_CTRL: &str = "--set-caps-ctrl";
+// command line of the restarted process: "--wait-pid <pid>"
+// the new process waits for the old one to exit before it takes the single instance mutex
+const ARG_WAIT_PID: &str = "--wait-pid";
 
 // hook handle and keyboard state flags accessed by the keyboard hook and window procedure.
 // atomic types are used for thread-safe interior mutability without `static mut`.
@@ -117,6 +122,14 @@ fn main() {
             _ => ERROR_INVALID_PARAMETER as i32,
         };
         std::process::exit(code);
+    }
+
+    // restarted by the tray menu:
+    // wait until the previous process exits, so that its mutex and keyboard hook are gone
+    if args.len() >= 3 && args[1] == ARG_WAIT_PID {
+        if let Ok(pid) = args[2].parse::<u32>() {
+            wait_for_process_exit(pid);
+        }
     }
 
     unsafe {
@@ -272,6 +285,16 @@ unsafe extern "system" fn window_proc(
                     // separator
                     AppendMenuW(h_menu, MF_SEPARATOR, 0, null());
 
+                    // add "Restart" item
+                    // grayed out while the registry change is in progress,
+                    // because the worker thread would be killed in the middle of the work
+                    let restart_text = encode_utf16("Restart");
+                    let mut restart_flags = MF_STRING;
+                    if CAPS_JOB_RUNNING.load(Ordering::SeqCst) {
+                        restart_flags |= MF_GRAYED;
+                    }
+                    AppendMenuW(h_menu, restart_flags, IDM_RESTART, restart_text.as_ptr());
+
                     // add Exit menu item
                     let menu_text = encode_utf16("Exit");
                     AppendMenuW(h_menu, MF_STRING, IDM_EXIT, menu_text.as_ptr());
@@ -322,6 +345,24 @@ unsafe extern "system" fn window_proc(
 
                 // toggle CapsLock -> Ctrl (writes the registry in a worker thread)
                 IDM_CAPS_CTRL => start_caps_ctrl_job(hwnd, !is_caps_ctrl_registered()),
+
+                // restart: start a new process, then quit this one
+                IDM_RESTART => {
+                    if CAPS_JOB_RUNNING.load(Ordering::SeqCst) {
+                        return 0;
+                    }
+                    match spawn_restart() {
+                        Ok(()) => unsafe { PostQuitMessage(0); },
+                        Err(e) => {
+                            // keep running if the new process could not be started
+                            let text_w = encode_utf16(&format!("Failed to restart. ({})", e));
+                            let title_w = encode_utf16("ime-alt");
+                            unsafe {
+                                MessageBoxW(hwnd, text_w.as_ptr(), title_w.as_ptr(), MB_OK | MB_ICONERROR | MB_SETFOREGROUND);
+                            }
+                        }
+                    }
+                },
 
                 _ => {}
             }
@@ -592,6 +633,28 @@ unsafe fn send_key_press(vk_code: u16) {
     }
 }
 
+// start this exe again with "--wait-pid <current pid>"
+fn spawn_restart() -> std::io::Result<()> {
+    let exe = std::env::current_exe()?;
+    std::process::Command::new(exe)
+        .arg(ARG_WAIT_PID)
+        .arg(std::process::id().to_string())
+        .spawn()?;
+    Ok(())
+}
+
+// wait until the given process exits (up to 10 seconds)
+fn wait_for_process_exit(pid: u32) {
+    unsafe {
+        let h_process = OpenProcess(PROCESS_SYNCHRONIZE, 0, pid);
+        if h_process.is_null() {
+            // the process has already exited
+            return;
+        }
+        WaitForSingleObject(h_process, 10_000);
+        CloseHandle(h_process);
+    }
+}
 
 // ---------------------------------------------------------------------------
 // CapsLock -> Ctrl (registry "Scancode Map")
