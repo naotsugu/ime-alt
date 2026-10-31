@@ -19,9 +19,7 @@ use windows_sys::Win32::System::Threading::{
     CreateMutexW, GetExitCodeProcess, OpenProcess, WaitForSingleObject, INFINITE,
     PROCESS_SYNCHRONIZE,
 };
-use windows_sys::Win32::UI::Input::KeyboardAndMouse::{
-    SendInput, INPUT, KEYBDINPUT, INPUT_KEYBOARD, KEYEVENTF_KEYUP,
-};
+use windows_sys::Win32::UI::Input::KeyboardAndMouse::{SendInput, INPUT, KEYBDINPUT, INPUT_KEYBOARD, KEYEVENTF_KEYUP, GetAsyncKeyState};
 use windows_sys::Win32::UI::Shell::{
     ShellExecuteExW, Shell_NotifyIconW,
     NIM_ADD, NIM_DELETE, NIF_ICON, NIF_MESSAGE, NIF_TIP, SEE_MASK_NOCLOSEPROCESS, SEE_MASK_NOASYNC,
@@ -46,6 +44,7 @@ const VK_LMENU:   u32 = 0xA4; // left alt
 const VK_RMENU:   u32 = 0xA5; // right alt
 const VK_IME_OFF: u16 = 0x1A; // ime off
 const VK_IME_ON:  u16 = 0x16; // ime on
+const VK_MENU:    i32 = 0x12; // alt (either side)
 
 // custom window message for system tray notifications
 const WM_MY_TRAYICON: u32 = WM_USER + 1;
@@ -62,6 +61,7 @@ const NOTIFY_FOR_THIS_SESSION: u32 = 0;
 const IDM_EXIT: usize = 1001;
 const IDM_ALT_IME: usize = 1002;   // toggle Alt -> IME
 const IDM_CAPS_CTRL: usize = 1003; // toggle CapsLock -> Ctrl
+const IDM_ABOUT: usize = 1004;     // show the About dialog
 const IDM_RESTART: usize = 1004;   // restart this application
 
 // registry: CapsLock -> Ctrl is done with the "Scancode Map" value
@@ -282,6 +282,10 @@ unsafe extern "system" fn window_proc(
                     }
                     AppendMenuW(h_menu, caps_flags, IDM_CAPS_CTRL, caps_text.as_ptr());
 
+                    // add "About..." item
+                    let about_text = encode_utf16("About...");
+                    AppendMenuW(h_menu, MF_STRING, IDM_ABOUT, about_text.as_ptr());
+
                     // separator
                     AppendMenuW(h_menu, MF_SEPARATOR, 0, null());
 
@@ -345,6 +349,9 @@ unsafe extern "system" fn window_proc(
 
                 // toggle CapsLock -> Ctrl (writes the registry in a worker thread)
                 IDM_CAPS_CTRL => start_caps_ctrl_job(hwnd, !is_caps_ctrl_registered()),
+
+                // show the application name, the version and the key state for diagnosis
+                IDM_ABOUT => show_about(hwnd),
 
                 // restart: start a new process, then quit this one
                 IDM_RESTART => {
@@ -602,6 +609,57 @@ fn clear_keys() {
 // returns true if any key other than Alt is currently held down
 fn is_other_key_pressed() -> bool {
     KEYS_DOWN.iter().any(|k| k.load(Ordering::Relaxed) != 0)
+}
+
+// virtual-key codes recorded as held by the keyboard hook, e.g. "0x1A, 0x20"
+fn recorded_keys_text() -> String {
+    let keys: Vec<String> = (0..256u32)
+        .filter(|&vk| {
+            let idx = (vk as usize / 64) & 3;
+            KEYS_DOWN[idx].load(Ordering::Relaxed) & (1u64 << (vk % 64)) != 0
+        })
+        .map(|vk| format!("0x{:02X}", vk))
+        .collect();
+    if keys.is_empty() { "(none)".to_string() } else { keys.join(", ") }
+}
+
+// virtual-key codes that the OS reports as held (GetAsyncKeyState), Alt keys excluded.
+// comparing this with recorded_keys_text() shows where the two states differ
+fn os_keys_text() -> String {
+    // 0x01..=0x07 are mouse buttons, so start from 0x08 (the first keyboard key)
+    let keys: Vec<String> = (0x08..=0xFE_i32)
+        .filter(|&vk| vk != VK_MENU && vk != VK_LMENU as i32 && vk != VK_RMENU as i32)
+        .filter(|&vk| (unsafe { GetAsyncKeyState(vk) } as u16 & 0x8000) != 0)
+        .map(|vk| format!("0x{:02X}", vk))
+        .collect();
+    if keys.is_empty() { "(none)".to_string() } else { keys.join(", ") }
+}
+
+// show the About dialog: application name, version and the current key state.
+// when the Alt -> IME switching stops working, open this before signing out
+fn show_about(hwnd: HWND) {
+    let text = format!(
+        "{} v{}\n\n\
+         Keys held (recorded by the hook): {}\n\
+         Keys held (reported by the OS): {}\n\n\
+         LAlt: pressed={} combination={}\n\
+         RAlt: pressed={} combination={}\n\
+         Alt to IME: {}",
+        env!("CARGO_PKG_NAME"),
+        env!("CARGO_PKG_VERSION"),
+        recorded_keys_text(),
+        os_keys_text(),
+        LALT_PRESSED.load(Ordering::Relaxed),
+        LALT_COMB.load(Ordering::Relaxed),
+        RALT_PRESSED.load(Ordering::Relaxed),
+        RALT_COMB.load(Ordering::Relaxed),
+        if ALT_IME_ENABLED.load(Ordering::Relaxed) { "enabled" } else { "disabled" },
+    );
+    let text_w = encode_utf16(&text);
+    let title_w = encode_utf16("About ime-alt");
+    unsafe {
+        MessageBoxW(hwnd, text_w.as_ptr(), title_w.as_ptr(), MB_OK | MB_ICONINFORMATION | MB_SETFOREGROUND);
+    }
 }
 
 unsafe fn send_key_press(vk_code: u16) {
