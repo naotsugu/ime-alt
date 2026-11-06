@@ -62,7 +62,7 @@ const IDM_EXIT: usize = 1001;
 const IDM_ALT_IME: usize = 1002;   // toggle Alt -> IME
 const IDM_CAPS_CTRL: usize = 1003; // toggle CapsLock -> Ctrl
 const IDM_ABOUT: usize = 1004;     // show the About dialog
-const IDM_RESTART: usize = 1004;   // restart this application
+const IDM_RESTART: usize = 1005;   // restart this application
 
 // registry: CapsLock -> Ctrl is done with the "Scancode Map" value
 const KEYBOARD_LAYOUT_KEY: &str = r"SYSTEM\CurrentControlSet\Control\Keyboard Layout";
