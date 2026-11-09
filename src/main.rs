@@ -94,8 +94,9 @@ static LALT_COMB: AtomicBool = AtomicBool::new(false);
 static RALT_COMB: AtomicBool = AtomicBool::new(false);
 
 // keys currently held (virtual-key code bitmap, 256 bits), tracked only from real
-// (non-injected) hook events. GetAsyncKeyState is not used because a stuck key
-// state survives an application restart
+// (non-injected) hook events. this record is only a candidate set: a keyup can be lost
+// or arrive with a different vkCode (e.g. IME keys), so every entry is verified with
+// GetAsyncKeyState before it is trusted (see is_other_key_pressed)
 static KEYS_DOWN: [AtomicU64; 4] = [
     AtomicU64::new(0),
     AtomicU64::new(0),
@@ -606,9 +607,31 @@ fn clear_keys() {
     }
 }
 
-// returns true if any key other than Alt is currently held down
+// returns true if any key other than Alt is really held down.
+// a key counts only when BOTH the hook record and the OS agree:
+//  - recorded but reported as up by the OS: its keyup was lost, so the record is stale
+//    and is dropped here. this keeps one lost keyup from blocking Alt -> IME for good
+//  - held according to the OS only (e.g. a key that was already stuck before this
+//    application started) is ignored, because it is not in the record
 fn is_other_key_pressed() -> bool {
-    KEYS_DOWN.iter().any(|k| k.load(Ordering::Relaxed) != 0)
+    let mut held = false;
+    for word in KEYS_DOWN.iter().enumerate() {
+        let (idx, k) = word;
+        let mut bits = k.load(Ordering::Relaxed);
+        while bits != 0 {
+            let pos = bits.trailing_zeros();
+            let bit = 1u64 << pos;
+            bits &= !bit;
+            let vk = (idx as i32) * 64 + pos as i32;
+            if (unsafe { GetAsyncKeyState(vk) } as u16 & 0x8000) != 0 {
+                held = true;
+            } else {
+                // stale record: forget it
+                k.fetch_and(!bit, Ordering::Relaxed);
+            }
+        }
+    }
+    held
 }
 
 // virtual-key codes recorded as held by the keyboard hook, e.g. "0x1A, 0x20"
